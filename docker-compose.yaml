@@ -1,6 +1,10 @@
 version: "3.9"
 services:
-  hysteria:
+  whisperbot:
     build: .
     container_name: whisper-bot
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 64M      # <‑‑ maximum RAM the container may use
