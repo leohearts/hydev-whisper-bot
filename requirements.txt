@@ -1,0 +1,2 @@
+python-telegram-bot[all]>=20.7
+httpx
