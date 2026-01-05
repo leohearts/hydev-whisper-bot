@@ -10,7 +10,7 @@ from telegram.request import HTTPXRequest
 logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
 
 # 限制最大同时处理的任务数，防止内存爆炸
-semaphore = asyncio.Semaphore(1)
+semaphore = asyncio.Semaphore(2)
 
 BASE_URL = "https://whisper0.hydev.org"
 HEADERS = {"Referer": "https://whisper.hydev.org/", "Origin": "https://whisper.hydev.org"}
@@ -19,15 +19,27 @@ async def handle_any_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     attachment = update.message.effective_attachment
     if not attachment: return
 
+    # 获取当前用户发送的消息 ID，用于后续所有回复的引用
+    original_msg_id = update.message.message_id
+
+    original_msg_id = update.message.message_id
+
+    # --- 修改点：在进入信号量之前就发送提示 ---
+    status_msg = await update.message.reply_text(
+        "⏳ 已加入队列，请稍候...",
+        reply_to_message_id=original_msg_id
+    )
+
+
     # 使用信号量：如果已经在处理2个任务，第3个用户会排队
     async with semaphore:
-        status_msg = await update.message.reply_text("⏳ 排队成功，开始处理...")
-
-        # 使用临时文件保存音频，不占用 RAM
-        with tempfile.NamedTemporaryFile(delete=False) as tmp:
-            tmp_path = tmp.name
-
         try:
+            await status_msg.edit_text("⏳ 正在处理...")
+
+            # 使用临时文件保存音频，不占用 RAM
+            with tempfile.NamedTemporaryFile(delete=False) as tmp:
+                tmp_path = tmp.name
+
             # 1. 下载到磁盘
             file = await context.bot.get_file(attachment.file_id)
             await file.download_to_drive(tmp_path)
@@ -41,30 +53,54 @@ async def handle_any_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 audio_id = upload_res.json().get("audio_id")
 
                 # 3. 轮询
+                # 3. 轮询进度
+                last_status_text = ""  # 记录上一次发送给 Telegram 的文字内容
+
                 while True:
                     prog_res = await client.get(f"{BASE_URL}/progress/{audio_id}")
                     prog_data = prog_res.json()
-                    if prog_data.get("done"): break
-                    await status_msg.edit_text(f"⏳ {prog_data.get('status', '处理中...')}")
-                    await asyncio.sleep(3)
+
+                    if prog_data.get("done"):
+                        break
+
+                    current_status = prog_data.get("status", "处理中...")
+                    new_status_text = f"⏳ {current_status}"
+
+                    # --- 核心修复：只有内容不同时才执行 edit_text ---
+                    if new_status_text != last_status_text:
+                        try:
+                            await status_msg.edit_text(new_status_text)
+                            last_status_text = new_status_text
+                        except Exception as e:
+                            # 即使判断了内容，偶尔也可能因为网络重试导致该错误，这里捕获它
+                            if "Message is not modified" not in str(e):
+                                logging.warning(f"Edit status error: {e}")
+
+                    await asyncio.sleep(2)
 
                 # 4. 结果
                 result_res = await client.get(f"{BASE_URL}/result/{audio_id}.json")
                 text = result_res.json().get("output", {}).get("text", "无内容")
-                await status_msg.edit_text(f"✅ 转录完成：\n\n{text}")
+                await status_msg.edit_text(f"{text}")
 
         except Exception as e:
             logging.error(f"Error: {e}")
-            await status_msg.edit_text("❌ 处理失败，可能是文件太大或服务器繁忙。")
+            try:
+                await status_msg.edit_text("❌ 处理失败，可能是文件太大或服务器繁忙。\n由于 Telegram 的限制，机器人目前只能处理 20MB 以下的文件。")
+            except Exception as e:
+                logging.error(f"Error: {e}")
         finally:
             # 运行完一定要删除临时文件！
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except Exception as e:
+                logging.error(f"Error: {e}")
 
 async def main():
     TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
     t_request = HTTPXRequest(connect_timeout=30, read_timeout=60)
-    app = ApplicationBuilder().token(TOKEN).request(t_request).build()
+    app = ApplicationBuilder().token(TOKEN).request(t_request).concurrent_updates(True).build()
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO | filters.Document.ALL, handle_any_media))
 
     async with app:

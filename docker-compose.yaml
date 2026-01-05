@@ -1,6 +1,6 @@
 version: "3.9"
 services:
-  whisperbot:
+  hysteria:
     build: .
     container_name: whisper-bot
     restart: unless-stopped
