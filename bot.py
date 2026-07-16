@@ -33,6 +33,7 @@ async def handle_any_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 使用信号量：如果已经在处理2个任务，第3个用户会排队
     async with semaphore:
+        tmp_path = None
         try:
             await status_msg.edit_text("⏳ 正在处理...")
 
@@ -50,21 +51,58 @@ async def handle_any_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     files = {'file': (getattr(attachment, 'file_name', 'audio.ogg'), f, 'application/octet-stream')}
                     upload_res = await client.post(f"{BASE_URL}/upload", files=files)
 
-                audio_id = upload_res.json().get("audio_id")
+                # 上传响应解析兜底
+                try:
+                    upload_json = upload_res.json()
+                except Exception:
+                    text = await upload_res.aread() if hasattr(upload_res, "aread") else await upload_res.text()
+                    await status_msg.edit_text(f"❌ 上传失败，无法解析服务器响应：{text}")
+                    return
+
+                audio_id = upload_json.get("audio_id")
+                if not audio_id:
+                    err_msg = upload_json.get("error") or upload_json.get("message") or str(upload_json)
+                    await status_msg.edit_text(f"❌ 上传失败：{err_msg}")
+                    return
 
                 # 3. 轮询
                 # 3. 轮询进度
                 last_status_text = ""  # 记录上一次发送给 Telegram 的文字内容
 
                 while True:
-                    prog_res = await client.get(f"{BASE_URL}/progress/{audio_id}")
-                    prog_data = prog_res.json()
+                    try:
+                        prog_res = await client.get(f"{BASE_URL}/progress/{audio_id}")
+                    except Exception as e:
+                        await status_msg.edit_text(f"❌ 查询进度失败：{e}")
+                        break
+
+                    try:
+                        prog_data = prog_res.json()
+                    except Exception:
+                        text = await prog_res.aread() if hasattr(prog_res, "aread") else await prog_res.text()
+                        await status_msg.edit_text(f"❌ 无法解析进度响应：{text}")
+                        break
+
+                    if prog_res.status_code < 200 or prog_res.status_code >= 300:
+                        err = prog_data.get("error") or prog_data.get("message") or (await prog_res.aread() if hasattr(prog_res, "aread") else await prog_res.text())
+                        await status_msg.edit_text(f"❌ 处理失败（服务器返回错误）：{err}")
+                        break
+
+                    if prog_data.get("error"):
+                        await status_msg.edit_text(f"❌ 处理失败：{prog_data.get('error')}")
+                        break
 
                     if prog_data.get("done"):
                         break
 
                     current_status = prog_data.get("status", "处理中...")
                     new_status_text = f"⏳ {current_status}"
+
+                    # 检测状态文本里的失败关键字
+                    status_lower = current_status.lower() if isinstance(current_status, str) else ""
+                    if any(s in status_lower for s in ("error", "failed", "format not recogniz", "format not recognised")):
+                        await status_msg.edit_text(f"❌ 处理失败：{current_status}")
+                        break
 
                     # --- 核心修复：只有内容不同时才执行 edit_text ---
                     if new_status_text != last_status_text:
@@ -79,8 +117,18 @@ async def handle_any_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await asyncio.sleep(2)
 
                 # 4. 结果
-                result_res = await client.get(f"{BASE_URL}/result/{audio_id}.json")
-                text = result_res.json().get("output", {}).get("text", "无内容")
+                try:
+                    result_res = await client.get(f"{BASE_URL}/result/{audio_id}.json")
+                except Exception as e:
+                    await status_msg.edit_text(f"❌ 获取结果失败：{e}")
+                    return
+                try:
+                    result_json = result_res.json()
+                except Exception:
+                    text = await result_res.aread() if hasattr(result_res, "aread") else await result_res.text()
+                    await status_msg.edit_text(f"❌ 无法解析结果响应：{text}")
+                    return
+                text = result_json.get("output", {}).get("text", "无内容")
                 await status_msg.edit_text(f"{text}")
 
         except Exception as e:
@@ -92,7 +140,7 @@ async def handle_any_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         finally:
             # 运行完一定要删除临时文件！
             try:
-                if os.path.exists(tmp_path):
+                if tmp_path and os.path.exists(tmp_path):
                     os.remove(tmp_path)
             except Exception as e:
                 logging.error(f"Error: {e}")
